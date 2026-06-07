@@ -7,21 +7,16 @@ namespace SmartPark.Tests;
 
 public class ParkingSessionManagerTests
 {
-    // ────────────────────────────────────────────────────────────
-    //  SHARED SETUP — create test doubles and the system-under-test.
-    //  Moq's Mock<T> creates test doubles that can act as:
-    //    - Stubs: .Setup().Returns() — provide canned answers
-    //    - Mocks: .Verify()         — assert interactions happened
-    //  You can use a constructor, or duplicate this in each test.
-    // ────────────────────────────────────────────────────────────
-
-    private readonly Mock<IPaymentGateway> _paymentStub = new();
+    private readonly Mock<IPaymentGateway>      _paymentStub      = new();
     private readonly Mock<INotificationService> _notificationStub = new();
-    private readonly Mock<IMembershipService> _membershipStub = new();
-    private readonly Mock<IParkingRepository> _repoStub = new();
-    private readonly Mock<IDateTimeProvider> _dateTimeStub = new();
-    private readonly ParkingFeeCalculator _feeCalculator = new();
-    private readonly ParkingSessionManager _manager;
+    private readonly Mock<IMembershipService>   _membershipStub   = new();
+    private readonly Mock<IParkingRepository>   _repoStub         = new();
+    private readonly Mock<IDateTimeProvider>    _dateTimeStub     = new();
+    private readonly ParkingFeeCalculator       _feeCalculator    = new();
+    private readonly ParkingSessionManager      _manager;
+
+    private static readonly DateTime FixedCheckIn  = new(2026, 3, 16, 10, 0, 0);
+    private static readonly DateTime FixedCheckOut = new(2026, 3, 16, 12, 0, 0);
 
     public ParkingSessionManagerTests()
     {
@@ -34,54 +29,194 @@ public class ParkingSessionManagerTests
             _dateTimeStub.Object);
     }
 
-    // ────────────────────────────────────────────────────────────
-    //  EXAMPLE TEST — shows stub setup + mock verification pattern.
-    //  .Setup().Returns() = STUB behavior (canned answer)
-    //  .Verify()          = MOCK behavior (interaction assertion)
-    //  Delete or keep this; it does not count toward your grade.
-    // ────────────────────────────────────────────────────────────
-
-    [Fact]
-    public async Task CheckInAsync_NewVehicle_LookUpMembership()
+    private ParkingTicket MakeActiveTicket(string plate = "PP-1234", string ticketId = "TICKET01")
     {
-        // Arrange — configure stubs (canned return values)
-        _membershipStub.Setup(m => m.GetMembershipTier("PP-9999")).Returns(MembershipTier.Guest);
-        _repoStub.Setup(r => r.GetActiveTicketByPlateAsync("PP-9999")).ReturnsAsync((ParkingTicket?)null);
-        _dateTimeStub.Setup(d => d.Now).Returns(new DateTime(2026, 3, 16, 10, 0, 0));
-
-        // Act
-        var ticket = await _manager.CheckInAsync("PP-9999", VehicleType.Car);
-
-        // Assert — verify as mock (was this interaction called?)
-        _membershipStub.Verify(m => m.GetMembershipTier("PP-9999"), Times.Once);
-        Assert.Equal("PP-9999", ticket.Vehicle.LicensePlate);
+        return new ParkingTicket
+        {
+            TicketId    = ticketId,
+            CheckInTime = FixedCheckIn,
+            Vehicle     = new Vehicle
+            {
+                LicensePlate = plate,
+                Type         = VehicleType.Car,
+                Membership   = MembershipTier.Guest
+            }
+        };
     }
 
     #region CheckIn — Happy Path
-    // Test successful vehicle check-in and verify correct interactions
+
+    [Fact]
+    public async Task CheckInAsync_NewVehicle_LooksUpMembershipOnce()
+    {
+        // Arrange
+        _membershipStub.Setup(m => m.GetMembershipTier("PP-9999")).Returns(MembershipTier.Guest);
+        _repoStub.Setup(r => r.GetActiveTicketByPlateAsync("PP-9999")).ReturnsAsync((ParkingTicket?)null);
+        _dateTimeStub.Setup(d => d.Now).Returns(FixedCheckIn);
+
+        // Act
+        await _manager.CheckInAsync("PP-9999", VehicleType.Car);
+
+        // Assert
+        _membershipStub.Verify(m => m.GetMembershipTier("PP-9999"), Times.Once);
+    }
+
+    [Fact]
+    public async Task CheckInAsync_NewVehicle_SavesTicketToRepository()
+    {
+        // Arrange
+        _membershipStub.Setup(m => m.GetMembershipTier("PP-1111")).Returns(MembershipTier.Gold);
+        _repoStub.Setup(r => r.GetActiveTicketByPlateAsync("PP-1111")).ReturnsAsync((ParkingTicket?)null);
+        _dateTimeStub.Setup(d => d.Now).Returns(FixedCheckIn);
+
+        // Act
+        var ticket = await _manager.CheckInAsync("PP-1111", VehicleType.SUV);
+
+        // Assert
+        _repoStub.Verify(r => r.SaveTicketAsync(It.IsAny<ParkingTicket>()), Times.Once);
+        Assert.Equal("PP-1111", ticket.Vehicle.LicensePlate);
+        Assert.Equal(MembershipTier.Gold, ticket.Vehicle.Membership);
+    }
+
     #endregion
 
     #region CheckIn — Validation
-    // Test check-in error scenarios and verify side effects
+
+    [Fact]
+    public async Task CheckInAsync_DuplicateActivePlate_ThrowsAndDoesNotSave()
+    {
+        // Arrange
+        var existingTicket = MakeActiveTicket("PP-DUPE");
+        _membershipStub.Setup(m => m.GetMembershipTier("PP-DUPE")).Returns(MembershipTier.Guest);
+        _repoStub.Setup(r => r.GetActiveTicketByPlateAsync("PP-DUPE")).ReturnsAsync(existingTicket);
+
+        // Act & Assert
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            _manager.CheckInAsync("PP-DUPE", VehicleType.Car));
+
+        _repoStub.Verify(r => r.SaveTicketAsync(It.IsAny<ParkingTicket>()), Times.Never);
+    }
+
     #endregion
 
     #region CheckOut — Happy Path
-    // Test successful check-out with payment and notification
+
+    [Fact]
+    public async Task CheckOutAsync_ValidTicket_ProcessesPaymentAndSendsReceipt()
+    {
+        // Arrange
+        var ticket = MakeActiveTicket();
+        _repoStub.Setup(r => r.GetTicketByIdAsync("TICKET01")).ReturnsAsync(ticket);
+        _dateTimeStub.Setup(d => d.Now).Returns(FixedCheckOut);
+        _paymentStub.Setup(p => p.ProcessPaymentAsync("TICKET01", It.IsAny<decimal>())).ReturnsAsync(true);
+
+        // Act
+        var result = await _manager.CheckOutAsync("TICKET01", "012-345-678");
+
+        // Assert
+        Assert.Equal(2_000m, result.TotalFee);
+        _paymentStub.Verify(p => p.ProcessPaymentAsync("TICKET01", 2_000m), Times.Once);
+        _notificationStub.Verify(n => n.SendReceiptAsync("012-345-678", It.IsAny<string>()), Times.Once);
+    }
+
     #endregion
 
     #region CheckOut — Payment Failure
-    // Test behavior when the payment step fails
+
+    [Fact]
+    public async Task CheckOutAsync_PaymentFails_ThrowsAndDoesNotUpdateTicket()
+    {
+        // Arrange
+        var ticket = MakeActiveTicket();
+        _repoStub.Setup(r => r.GetTicketByIdAsync("TICKET01")).ReturnsAsync(ticket);
+        _dateTimeStub.Setup(d => d.Now).Returns(FixedCheckOut);
+        _paymentStub.Setup(p => p.ProcessPaymentAsync(It.IsAny<string>(), It.IsAny<decimal>())).ReturnsAsync(false);
+
+        // Act & Assert
+        await Assert.ThrowsAsync<Exception>(() =>
+            _manager.CheckOutAsync("TICKET01", "012-345-678"));
+
+        _repoStub.Verify(r => r.UpdateTicketAsync(It.IsAny<ParkingTicket>()), Times.Never);
+        _notificationStub.Verify(n => n.SendReceiptAsync(It.IsAny<string>(), It.IsAny<string>()), Times.Never);
+    }
+
     #endregion
 
     #region CheckOut — Notification Failure
-    // Test what happens when sending the receipt fails
+
+    [Fact]
+    public async Task CheckOutAsync_NotificationFails_CheckoutStillSucceeds()
+    {
+        // Arrange
+        var ticket = MakeActiveTicket();
+        _repoStub.Setup(r => r.GetTicketByIdAsync("TICKET01")).ReturnsAsync(ticket);
+        _dateTimeStub.Setup(d => d.Now).Returns(FixedCheckOut);
+        _paymentStub.Setup(p => p.ProcessPaymentAsync(It.IsAny<string>(), It.IsAny<decimal>())).ReturnsAsync(true);
+        _notificationStub.Setup(n => n.SendReceiptAsync(It.IsAny<string>(), It.IsAny<string>()))
+            .ThrowsAsync(new Exception("SMS down"));
+
+        // Act
+        var result = await _manager.CheckOutAsync("TICKET01", "012-345-678");
+
+        // Assert
+        Assert.Equal(2_000m, result.TotalFee);
+        _repoStub.Verify(r => r.UpdateTicketAsync(It.IsAny<ParkingTicket>()), Times.Once);
+    }
+
     #endregion
 
     #region CheckOut — Validation
-    // Test check-out error scenarios for missing or invalid tickets
+
+    [Fact]
+    public async Task CheckOutAsync_TicketNotFound_ThrowsKeyNotFoundException()
+    {
+        // Arrange
+        _repoStub.Setup(r => r.GetTicketByIdAsync("MISSING")).ReturnsAsync((ParkingTicket?)null);
+
+        // Act & Assert
+        await Assert.ThrowsAsync<KeyNotFoundException>(() =>
+            _manager.CheckOutAsync("MISSING", "012-345-678"));
+    }
+
+    [Fact]
+    public async Task CheckOutAsync_AlreadyCheckedOut_ThrowsInvalidOperationException()
+    {
+        // Arrange
+        var ticket = MakeActiveTicket();
+        ticket.CheckOutTime = FixedCheckOut;
+        _repoStub.Setup(r => r.GetTicketByIdAsync("TICKET01")).ReturnsAsync(ticket);
+        _dateTimeStub.Setup(d => d.Now).Returns(FixedCheckOut.AddHours(1));
+
+        // Act & Assert
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            _manager.CheckOutAsync("TICKET01", "012-345-678"));
+    }
+
     #endregion
 
     #region Verify Interaction Order
-    // Verify that dependencies are called in the correct sequence
+
+    [Fact]
+    public async Task CheckOutAsync_PaymentBeforeTicketUpdate()
+    {
+        // Arrange
+        var callOrder = new List<string>();
+        var ticket = MakeActiveTicket();
+        _repoStub.Setup(r => r.GetTicketByIdAsync("TICKET01")).ReturnsAsync(ticket);
+        _dateTimeStub.Setup(d => d.Now).Returns(FixedCheckOut);
+        _paymentStub.Setup(p => p.ProcessPaymentAsync(It.IsAny<string>(), It.IsAny<decimal>()))
+            .Callback(() => callOrder.Add("payment")).ReturnsAsync(true);
+        _repoStub.Setup(r => r.UpdateTicketAsync(It.IsAny<ParkingTicket>()))
+            .Callback(() => callOrder.Add("update")).Returns(Task.CompletedTask);
+        _notificationStub.Setup(n => n.SendReceiptAsync(It.IsAny<string>(), It.IsAny<string>()))
+            .Callback(() => callOrder.Add("receipt")).Returns(Task.CompletedTask);
+
+        // Act
+        await _manager.CheckOutAsync("TICKET01", "012-345-678");
+
+        // Assert
+        Assert.Equal(new[] { "payment", "update", "receipt" }, callOrder);
+    }
+
     #endregion
 }
