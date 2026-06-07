@@ -40,6 +40,40 @@ public class ParkingFeeCalculatorTests
 
     #endregion
 
- 
+    #region Grace Period
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(15)]
+    [InlineData(30)]
+    public void CalculateFee_WithinGracePeriod_ReturnsFree(int minutes)
+    {
+        // Arrange
+        var checkIn  = Monday10Am;
+        var checkOut = checkIn.AddMinutes(minutes);
+
+        // Act
+        var result = _calculator.CalculateFee(VehicleType.Car, MembershipTier.Guest, checkIn, checkOut);
+
+        // Assert
+        Assert.Equal(0m, result.BaseFee);
+        Assert.Equal(0m, result.TotalFee);
+         }
+
+    [Fact]
+    public void CalculateFee_31Minutes_ChargesOneHour()
+    {
+        // Arrange
+        var checkIn  = Monday10Am;
+        var checkOut = checkIn.AddMinutes(31);
+
+        // Act
+        var result = _calculator.CalculateFee(VehicleType.Car, MembershipTier.Guest, checkIn, checkOut);
+
+        // Assert
+        Assert.Equal(1_000m, result.TotalFee);
+    }
+
+    #endregion
 
 }
